@@ -73,7 +73,7 @@ void HeltecV4Board::begin() {
 
     digitalWrite(PIN_ADC_CTRL, LOW);
 
-    return (5.42 * (3.3 / 1024.0) * raw) * 1000;
+    return (adc_mult * (3.3 / 1024.0) * raw) * 1000;
   }
 
   const char* HeltecV4Board::getManufacturerName() const {
@@ -82,4 +82,22 @@ void HeltecV4Board::begin() {
 #else
     return loRaFEMControl.getFEMType() == KCT8103L_PA ? "Heltec V4.3 OLED" : "Heltec V4 OLED";
 #endif
+  }
+
+  bool HeltecV4Board::setLoRaFemLnaEnabled(bool enable) {
+    if (!loRaFEMControl.isLnaCanControl()) {
+      return false;
+    }
+
+    loRaFEMControl.setLNAEnable(enable);
+    loRaFEMControl.setRxModeEnable();
+    return true;
+  }
+
+  bool HeltecV4Board::canControlLoRaFemLna() const {
+    return loRaFEMControl.isLnaCanControl();
+  }
+
+  bool HeltecV4Board::isLoRaFemLnaEnabled() const {
+    return loRaFEMControl.isLNAEnabled();
   }

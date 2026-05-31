@@ -61,6 +61,9 @@
 #define CMD_SEND_CHANNEL_DATA         62
 #define CMD_SET_DEFAULT_FLOOD_SCOPE   63
 #define CMD_GET_DEFAULT_FLOOD_SCOPE   64
+#define CMD_SEND_RAW_PACKET           65
+#define CMD_GET_RADIO_FEM_RXGAIN      66
+#define CMD_SET_RADIO_FEM_RXGAIN      67
 
 // Stats sub-types for CMD_GET_STATS
 #define STATS_TYPE_CORE               0
@@ -495,19 +498,27 @@ void MyMesh::sendFloodScoped(const TransportKey& scope, mesh::Packet* pkt, uint3
 
 void MyMesh::sendFloodScoped(const ContactInfo& recipient, mesh::Packet* pkt, uint32_t delay_millis) {
   // TODO: dynamic send_scope, depending on recipient and current 'home' Region
-  TransportKey default_scope;
-  memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
+  if (send_unscoped) {
+    sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);  // app has explicitly requested un-scoped
+  } else {
+    TransportKey default_scope;
+    memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
 
-  auto scope = send_scope.isNull() ? &default_scope : &send_scope;
-  sendFloodScoped(*scope, pkt, delay_millis);
+    auto scope = send_scope.isNull() ? &default_scope : &send_scope;
+    sendFloodScoped(*scope, pkt, delay_millis);
+  }
 }
 void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis) {
   // TODO: have per-channel send_scope
-  TransportKey default_scope;
-  memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
+  if (send_unscoped) {
+    sendFlood(pkt, delay_millis, _prefs.path_hash_mode + 1);  // app has explicitly requested un-scoped
+  } else {
+    TransportKey default_scope;
+    memcpy(&default_scope.key, _prefs.default_scope_key, sizeof(default_scope.key));
 
-  auto scope = send_scope.isNull() ? &default_scope : &send_scope;
-  sendFloodScoped(*scope, pkt, delay_millis);
+    auto scope = send_scope.isNull() ? &default_scope : &send_scope;
+    sendFloodScoped(*scope, pkt, delay_millis);
+  }
 }
 
 void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
@@ -856,6 +867,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   dirty_contacts_expiry = 0;
   memset(advert_paths, 0, sizeof(advert_paths));
   memset(send_scope.key, 0, sizeof(send_scope.key));
+  send_unscoped = false;
 
   // defaults
   memset(&_prefs, 0, sizeof(_prefs));
@@ -876,6 +888,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   _prefs.rx_boosted_gain = 1; // enabled by default
 #endif
 #endif
+  _prefs.radio_fem_rxgain = 1;
 }
 
 void MyMesh::begin(bool has_display) {
@@ -925,6 +938,7 @@ void MyMesh::begin(bool has_display) {
   _prefs.tx_power_dbm = constrain(_prefs.tx_power_dbm, -9, MAX_LORA_TX_POWER);
   _prefs.gps_enabled = constrain(_prefs.gps_enabled, 0, 1);  // Ensure boolean 0 or 1
   _prefs.gps_interval = constrain(_prefs.gps_interval, 0, 86400);  // Max 24 hours
+  _prefs.radio_fem_rxgain = constrain(_prefs.radio_fem_rxgain, 0, 1);
 
 #ifdef BLE_PIN_CODE // 123456 by default
   if (_prefs.ble_pin == 0) {
@@ -951,9 +965,10 @@ void MyMesh::begin(bool has_display) {
   addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
   _store->loadChannels(this);
 
-  radio_set_params(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-  radio_set_tx_power(_prefs.tx_power_dbm);
+  radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+  radio_driver.setTxPower(_prefs.tx_power_dbm);
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
+  board.setLoRaFemLnaEnabled(_prefs.radio_fem_rxgain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
 }
@@ -973,9 +988,13 @@ struct FreqRange {
 };
 
 static FreqRange repeat_freq_ranges[] = {
+  #ifdef ALLOWED_REPEAT_FREQ_RANGE
+  ALLOWED_REPEAT_FREQ_RANGE
+  #else
   { 433000, 433000 },
   { 869000, 869000 },
   { 918000, 918000 }
+  #endif
 };
 
 bool MyMesh::isValidClientRepeatFreq(uint32_t f) const {
@@ -1374,7 +1393,7 @@ void MyMesh::handleCmdFrame(size_t len) {
       _prefs.client_repeat = repeat;
       savePrefs();
 
-      radio_set_params(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
+      radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 
@@ -1391,7 +1410,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       _prefs.tx_power_dbm = power;
       savePrefs();
-      radio_set_tx_power(_prefs.tx_power_dbm);
+      radio_driver.setTxPower(_prefs.tx_power_dbm);
       writeOKFrame();
     }
   } else if (cmd_frame[0] == CMD_SET_TUNING_PARAMS) {
@@ -1798,6 +1817,30 @@ void MyMesh::handleCmdFrame(size_t len) {
     } else {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     }
+  } else if (cmd_frame[0] == CMD_GET_RADIO_FEM_RXGAIN) {
+    if (!board.canControlLoRaFemLna()) {
+      writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+    } else {
+      out_frame[0] = RESP_CODE_OK;
+      uint8_t value = board.isLoRaFemLnaEnabled() ? 1 : 0;
+      memcpy(&out_frame[1], &value, 1);
+      _serial->writeFrame(out_frame, 2);
+    }
+  } else if (cmd_frame[0] == CMD_SET_RADIO_FEM_RXGAIN && len >= 2) {
+    uint8_t value = cmd_frame[1];
+    if (!board.canControlLoRaFemLna()) {
+      writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+    } else if (value <= 1) {
+      _prefs.radio_fem_rxgain = value;
+      if (board.setLoRaFemLnaEnabled(value != 0)) {
+        savePrefs();
+        writeOKFrame();
+      } else {
+        writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+      }
+    } else {
+      writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+    }
   } else if (cmd_frame[0] == CMD_GET_ADVERT_PATH && len >= PUB_KEY_SIZE+2) {
     // FUTURE use:  uint8_t reserved = cmd_frame[1];
     uint8_t *pub_key = &cmd_frame[2];
@@ -1885,10 +1928,14 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
   } else if (cmd_frame[0] == CMD_SET_FLOOD_SCOPE_KEY && len >= 2 && cmd_frame[1] == 0) {
     if (len >= 2 + 16) {
-      memcpy(send_scope.key, &cmd_frame[2], sizeof(send_scope.key));  // set curr scope TransportKey
+      memcpy(send_scope.key, &cmd_frame[2], sizeof(send_scope.key));  // set scope override TransportKey
     } else {
-      memset(send_scope.key, 0, sizeof(send_scope.key));  // set scope to null
+      memset(send_scope.key, 0, sizeof(send_scope.key));  // reset scope override
     }
+    send_unscoped = false;
+    writeOKFrame();
+  } else if (cmd_frame[0] == CMD_SET_FLOOD_SCOPE_KEY && len >= 2 && cmd_frame[1] == 1) {  // ver 12+
+    send_unscoped = true;
     writeOKFrame();
   } else if (cmd_frame[0] == CMD_SET_DEFAULT_FLOOD_SCOPE && len >= 1) {
     if (len >= 1+31+16) {
@@ -1946,6 +1993,19 @@ void MyMesh::handleCmdFrame(size_t len) {
       memcpy(&out_frame[i], &r->upper_freq, 4); i += 4;
     }
     _serial->writeFrame(out_frame, i);
+  } else if (cmd_frame[0] == CMD_SEND_RAW_PACKET && len >= 4) {
+    auto pkt = obtainNewPacket();
+    if (pkt) {
+      uint8_t priority = cmd_frame[1];
+      if (tryParsePacket(pkt, &cmd_frame[2], len - 2)) {
+        sendPacket(pkt, priority, 0);
+        writeOKFrame();
+      } else {
+        writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+      }
+    } else {
+      writeErrFrame(ERR_CODE_TABLE_FULL);
+    }
   } else {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
     MESH_DEBUG_PRINTLN("ERROR: unknown command: %02X", cmd_frame[0]);
